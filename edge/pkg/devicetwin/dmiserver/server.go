@@ -48,7 +48,7 @@ import (
 )
 
 const (
-	Limit = 1000
+	Limit = 1
 	Burst = 100
 )
 
