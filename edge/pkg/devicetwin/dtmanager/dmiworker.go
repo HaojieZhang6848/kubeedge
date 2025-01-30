@@ -133,14 +133,14 @@ func (dw *DMIWorker) dealMetaDeviceOperation(_ *dtcontext.DTContext, _ string, m
 				return err
 			}
 		case model.DeleteOperation:
+			dw.dmiCache.DeviceMu.Lock()
+			delete(dw.dmiCache.DeviceList, deviceID)
+			dw.dmiCache.DeviceMu.Unlock()
 			err = dmiclient.DMIClientsImp.RemoveDevice(&device)
 			if err != nil {
 				klog.Errorf("delete device %s failed with err: %v", device.Name, err)
 				return err
 			}
-			dw.dmiCache.DeviceMu.Lock()
-			delete(dw.dmiCache.DeviceList, deviceID)
-			dw.dmiCache.DeviceMu.Unlock()
 		case model.UpdateOperation:
 			dw.dmiCache.DeviceMu.Lock()
 			dw.dmiCache.DeviceList[deviceID] = &device
