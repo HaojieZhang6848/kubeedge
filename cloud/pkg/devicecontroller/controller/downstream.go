@@ -242,6 +242,7 @@ func isDeviceUpdated(oldTwin *v1beta1.Device, newTwin *v1beta1.Device) bool {
 	// does not care fields
 	oldTwin.ObjectMeta.ResourceVersion = newTwin.ObjectMeta.ResourceVersion
 	oldTwin.ObjectMeta.Generation = newTwin.ObjectMeta.Generation
+	oldTwin.ObjectMeta.ManagedFields = newTwin.ObjectMeta.ManagedFields
 	// return true if ObjectMeta or Spec or Status changed, else false
 	return !reflect.DeepEqual(oldTwin.ObjectMeta, newTwin.ObjectMeta) || !reflect.DeepEqual(oldTwin.Spec, newTwin.Spec)
 }
