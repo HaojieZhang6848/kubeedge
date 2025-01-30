@@ -287,12 +287,12 @@ func (d *DevPanel) DevInit(deviceList []*dmiapi.Device, deviceModelList []*dmiap
 	for i := range deviceModelList {
 		model := deviceModelList[i]
 		cur := parse.GetDeviceModelFromGrpc(model)
-		d.models[model.Name] = cur
+		d.models[cur.ID] = cur
 	}
 
 	for i := range deviceList {
 		device := deviceList[i]
-		commonModel := d.models[device.Spec.DeviceModelReference]
+		commonModel := d.models[parse.GetResourceID(device.GetNamespace(), device.GetSpec().GetDeviceModelReference())]
 		protocol, err := parse.BuildProtocolFromGrpc(device)
 		if err != nil {
 			return err
