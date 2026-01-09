@@ -20,11 +20,16 @@ import (
 	"context"
 	"encoding/json"
 	"strconv"
+	"sync"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/kubeedge/api/apis/devices/v1beta1"
 	crdClientset "github.com/kubeedge/api/client/clientset/versioned"
+	"github.com/kubeedge/api/client/clientset/versioned/scheme"
 	beehiveContext "github.com/kubeedge/beehive/pkg/core/context"
 	"github.com/kubeedge/beehive/pkg/core/model"
 	keclient "github.com/kubeedge/kubeedge/cloud/pkg/common/client"
@@ -73,6 +78,15 @@ type UpstreamController struct {
 	deviceStatesChan chan model.Message
 	// downstream controller to update device status in cache
 	dc *DownstreamController
+	// twinsCache caches twins for each device to avoid frequent API server queries
+	// key: deviceID, value: *cachedDeviceStatus
+	twinsCache sync.Map
+}
+
+// cachedDeviceStatus holds twins and ResourceVersion for optimistic locking
+type cachedDeviceStatus struct {
+	twins           []v1beta1.Twin
+	resourceVersion string
 }
 
 // Start UpstreamController
@@ -154,33 +168,42 @@ func (uc *UpstreamController) updateDeviceStatus() {
 				continue
 			}
 
-			cachedDeviceStatus, err := uc.dc.getOrCreateDeviceStatusForDevice(cacheDevice)
-			if err != nil {
-				klog.Warningf("Failed to ensure device status for device %s", deviceID)
-				continue
-			}
-
-			// Store the status in cache so that when update is received by informer
-			cachedDeviceStatus.Status.State = msgState.Device.State
-			cachedDeviceStatus.Status.LastOnlineTime = msgState.Device.LastOnlineTime
-			uc.dc.deviceStatusManager.DeviceStatus.Store(deviceID, cachedDeviceStatus)
-
-			deviceStatusPatch := &DeviceStatusCRDPatch{
-				Status: DeviceStatusStatusPatch{
-					State:          cachedDeviceStatus.Status.State,
-					LastOnlineTime: cachedDeviceStatus.Status.LastOnlineTime,
+			deviceStatusApply := &v1beta1.DeviceStatus{
+				TypeMeta: metav1.TypeMeta{
+					APIVersion: v1beta1.SchemeGroupVersion.String(),
+					Kind:       "DeviceStatus",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      cacheDevice.Name,
+					Namespace: cacheDevice.Namespace,
+				},
+				Status: v1beta1.DeviceStatusStatus{
+					State:          msgState.Device.State,
+					LastOnlineTime: msgState.Device.LastOnlineTime,
 				},
 			}
 
-			body, err := json.Marshal(deviceStatusPatch)
-			if err != nil {
-				klog.Errorf("Failed to marshal device states %v", cachedDeviceStatus.Status)
+			if err := controllerutil.SetControllerReference(cacheDevice, deviceStatusApply, scheme.Scheme); err != nil {
+				klog.Errorf("Failed to set controller reference for device %s: %v", deviceID, err)
 				continue
 			}
-			err = uc.crdClient.DevicesV1beta1().RESTClient().Patch(MergePatchType).Namespace(cachedDeviceStatus.Namespace).Resource(ResourceTypeDeviceStatuses).Name(cachedDeviceStatus.Name).Body(body).Do(context.Background()).Error()
+
+			body, err := json.Marshal(deviceStatusApply)
 			if err != nil {
-				klog.Errorf("Failed to patch device states %v of device %v in namespace %v, err: %v", cachedDeviceStatus,
-					deviceID, cachedDeviceStatus.Namespace, err)
+				klog.Errorf("Failed to marshal device states %v", deviceStatusApply.Status)
+				continue
+			}
+			forceApply := true
+			_, err = uc.crdClient.DevicesV1beta1().DeviceStatuses(deviceStatusApply.Namespace).Patch(
+				context.Background(),
+				deviceStatusApply.Name,
+				k8stypes.ApplyPatchType,
+				body,
+				metav1.PatchOptions{FieldManager: modules.DeviceControllerModuleName, Force: &forceApply},
+			)
+			if err != nil {
+				klog.Errorf("Failed to apply device states %v of device %v in namespace %v, err: %v", deviceStatusApply,
+					deviceID, deviceStatusApply.Namespace, err)
 				continue
 			}
 
@@ -228,16 +251,53 @@ func (uc *UpstreamController) updateDeviceStatus() {
 				continue
 			}
 
-			cachedDeviceStatus, err := uc.dc.getOrCreateDeviceStatusForDevice(cacheDevice)
-			if err != nil {
-				klog.Warningf("Failed to ensure device status for device %s", deviceID)
-				continue
-			}
+			// Retry loop for optimistic locking
+			const maxRetries = 3
+			for retry := 0; retry < maxRetries; retry++ {
+				if retry > 0 {
+					klog.Infof("Retrying twin update for device %s, attempt %d/%d", deviceID, retry+1, maxRetries)
+				}
 
-			deviceStatus := &DeviceStatus{Status: cachedDeviceStatus.Status}
-			for twinName, twin := range msgTwin.Twin {
-				deviceTwin := findOrCreateTwinByName(twinName, cacheDevice.Spec.Properties, deviceStatus)
-				if deviceTwin != nil {
+				// Try to get twins and ResourceVersion from cache first
+				var twins []v1beta1.Twin
+				var resourceVersion string
+				if cached, found := uc.twinsCache.Load(deviceID); found {
+					cachedStatus := cached.(*cachedDeviceStatus)
+					twins = cachedStatus.twins
+					resourceVersion = cachedStatus.resourceVersion
+				} else {
+					// Cache miss, fetch from API server
+					existingDeviceStatus, err := uc.crdClient.DevicesV1beta1().DeviceStatuses(cacheDevice.Namespace).Get(
+						context.Background(),
+						cacheDevice.Name,
+						metav1.GetOptions{},
+					)
+					if err == nil && existingDeviceStatus != nil {
+						twins = existingDeviceStatus.Status.Twins
+						resourceVersion = existingDeviceStatus.ResourceVersion
+					}
+				}
+
+				// Update or append twins from message
+				for twinName, twin := range msgTwin.Twin {
+					// Only process twins that are defined in device properties
+					if !isPropertyDefined(twinName, cacheDevice.Spec.Properties) {
+						continue
+					}
+
+					// Find existing twin or create new one
+					twinIndex := -1
+					for i := range twins {
+						if twins[i].PropertyName == twinName {
+							twinIndex = i
+							break
+						}
+					}
+
+					deviceTwin := v1beta1.Twin{
+						PropertyName: twinName,
+					}
+
 					if twin.Actual != nil && twin.Actual.Value != nil {
 						reported := v1beta1.TwinProperty{}
 						reported.Value = *twin.Actual.Value
@@ -263,29 +323,74 @@ func (uc *UpstreamController) updateDeviceStatus() {
 						}
 						deviceTwin.ObservedDesired = observedDesired
 					}
+
+					// Update existing twin or append new one
+					if twinIndex >= 0 {
+						twins[twinIndex] = deviceTwin
+					} else {
+						twins = append(twins, deviceTwin)
+					}
 				}
+
+				deviceStatusApply := &v1beta1.DeviceStatus{
+					TypeMeta: metav1.TypeMeta{
+						APIVersion: v1beta1.SchemeGroupVersion.String(),
+						Kind:       "DeviceStatus",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            cacheDevice.Name,
+						Namespace:       cacheDevice.Namespace,
+						ResourceVersion: resourceVersion,
+					},
+					Status: v1beta1.DeviceStatusStatus{
+						Twins: twins,
+						Extensions: v1beta1.DeviceStatusExtensions{
+							Data: map[string]interface{}{},
+						},
+					},
+				}
+
+				if err := controllerutil.SetControllerReference(cacheDevice, deviceStatusApply, scheme.Scheme); err != nil {
+					klog.Errorf("Failed to set controller reference for device %s: %v", deviceID, err)
+					continue
+				}
+
+				body, err := json.Marshal(deviceStatusApply)
+				if err != nil {
+					klog.Errorf("Failed to marshal device status %v", deviceStatusApply.Status)
+					break
+				}
+
+				// Use SSA without Force to detect conflicts
+				patchedStatus, err := uc.crdClient.DevicesV1beta1().DeviceStatuses(cacheDevice.Namespace).Patch(
+					utilcontext.FromMessage(context.Background(), msg),
+					cacheDevice.Name,
+					k8stypes.ApplyPatchType,
+					body,
+					metav1.PatchOptions{FieldManager: modules.DeviceControllerModuleName},
+				)
+				if err != nil {
+					// Check if it's a conflict error
+					if retry < maxRetries-1 {
+						// Invalidate cache and retry
+						uc.twinsCache.Delete(deviceID)
+						klog.Warningf("Conflict detected for device %s, will retry: %v", deviceID, err)
+						continue
+					}
+					klog.Errorf("Failed to apply device status %v of device %v in namespace %v after %d retries, err: %v", deviceStatusApply.Status, deviceID, cacheDevice.Namespace, maxRetries, err)
+					break
+				}
+
+				// Update cache with new ResourceVersion after successful patch
+				uc.twinsCache.Store(deviceID, &cachedDeviceStatus{
+					twins:           twins,
+					resourceVersion: patchedStatus.ResourceVersion,
+				})
+
+				// Success, break retry loop
+				break
 			}
 
-			// Store the status in cache so that when update is received by informer
-			cachedDeviceStatus.Status.Twins = deviceStatus.Status.Twins
-			uc.dc.deviceStatusManager.DeviceStatus.Store(deviceID, cachedDeviceStatus)
-
-			DeviceStatusPatch := &DeviceStatusCRDPatch{
-				Status: DeviceStatusStatusPatch{
-					Twins: deviceStatus.Status.Twins,
-				},
-			}
-
-			body, err := json.Marshal(DeviceStatusPatch)
-			if err != nil {
-				klog.Errorf("Failed to marshal device status %v", deviceStatus)
-				continue
-			}
-			err = uc.crdClient.DevicesV1beta1().RESTClient().Patch(MergePatchType).Namespace(cacheDevice.Namespace).Resource(ResourceTypeDeviceStatuses).Name(cachedDeviceStatus.Name).Body(body).Do(utilcontext.FromMessage(context.Background(), msg)).Error()
-			if err != nil {
-				klog.Errorf("Failed to patch device status %v of device %v in namespace %v, err: %v", deviceStatus, deviceID, cacheDevice.Namespace, err)
-				continue
-			}
 			//send confirm message to edge twin
 			resMsg := model.NewMessage(msg.GetID())
 			nodeID, err := messagelayer.GetNodeID(msg)
@@ -344,6 +449,15 @@ func NewUpstreamController(dc *DownstreamController) (*UpstreamController, error
 		dc:           dc,
 	}
 	return uc, nil
+}
+
+func isPropertyDefined(propertyName string, properties []v1beta1.DeviceProperty) bool {
+	for i := range properties {
+		if propertyName == properties[i].Name {
+			return true
+		}
+	}
+	return false
 }
 
 func findOrCreateTwinByName(twinName string, properties []v1beta1.DeviceProperty, deviceStatus *DeviceStatus) *v1beta1.Twin {

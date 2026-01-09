@@ -54,10 +54,8 @@ type DownstreamController struct {
 	kubeClient   kubernetes.Interface
 	crdClient    crdClientset.Interface
 	messageLayer messagelayer.MessageLayer
-
-	deviceManager       *manager.DeviceManager
-	deviceModelManager  *manager.DeviceModelManager
-	deviceStatusManager *manager.DeviceStatusManager
+	deviceManager      *manager.DeviceManager
+	deviceModelManager *manager.DeviceModelManager
 }
 
 // syncDeviceModel is used to get events from informer
@@ -178,13 +176,6 @@ func (dc *DownstreamController) deviceAdded(device *v1beta1.Device) {
 
 // getOrCreateDeviceStatusForDevice creates a DeviceStatus for the given Device if it does not already exist.
 func (dc *DownstreamController) getOrCreateDeviceStatusForDevice(device *v1beta1.Device) (*v1beta1.DeviceStatus, error) {
-	deviceId := util.GetResourceID(device.Namespace, device.Name)
-	if val, exists := dc.deviceStatusManager.DeviceStatus.Load(deviceId); exists {
-		if deviceStatus, ok := val.(*v1beta1.DeviceStatus); ok {
-			return deviceStatus, nil
-		}
-	}
-
 	deviceStatus, err := dc.crdClient.DevicesV1beta1().DeviceStatuses(device.Namespace).Get(context.Background(), device.Name, metav1.GetOptions{})
 	if err == nil {
 		return deviceStatus, nil
@@ -430,63 +421,6 @@ func (dc *DownstreamController) sendDeviceModelMsg(device *v1beta1.Device, opera
 	}
 }
 
-// syncDeviceStatus is used to get device status events from informer
-func (dc *DownstreamController) syncDeviceStatus() {
-	for {
-		select {
-		case <-beehiveContext.Done():
-			klog.Info("Stop syncDeviceStatus")
-			return
-		case e := <-dc.deviceStatusManager.Events():
-			deviceStatus, ok := e.Object.(*v1beta1.DeviceStatus)
-			if !ok {
-				klog.Warningf("Object type: %T unsupported", e.Object)
-				continue
-			}
-			switch e.Type {
-			case watch.Added:
-				dc.deviceStatusAdded(deviceStatus)
-			case watch.Modified:
-				dc.deviceStatusUpdated(deviceStatus)
-			case watch.Deleted:
-				dc.deviceStatusDeleted(deviceStatus)
-			default:
-				klog.Warningf("DeviceStatus event type: %s unsupported", e.Type)
-			}
-		}
-	}
-}
-
-// deviceStatusAdded is function to process addition of new deviceStatus in apiserver
-func (dc *DownstreamController) deviceStatusAdded(deviceStatus *v1beta1.DeviceStatus) {
-	deviceStatusID := util.GetResourceID(deviceStatus.Namespace, deviceStatus.Name)
-	dc.deviceStatusManager.DeviceStatus.Store(deviceStatusID, deviceStatus)
-}
-
-// deviceStatusUpdated is function to process updated deviceStatus
-func (dc *DownstreamController) deviceStatusUpdated(deviceStatus *v1beta1.DeviceStatus) {
-	deviceStatusID := util.GetResourceID(deviceStatus.Namespace, deviceStatus.Name)
-	device, ok := dc.deviceManager.Device.Load(deviceStatusID)
-	if !ok {
-		klog.Warningf("Device not found for deviceStatus %s/%s", deviceStatus.Namespace, deviceStatus.Name)
-		return
-	}
-	deviceObj, ok := device.(*v1beta1.Device)
-	if !ok {
-		klog.Warningf("Invalid device object for deviceStatus %s/%s", deviceStatus.Namespace, deviceStatus.Name)
-		return
-	}
-	// Remove twin with changed attribute names.
-	removeTwinWithNameChanged(deviceStatus, deviceObj)
-	dc.deviceStatusManager.DeviceStatus.Store(deviceStatusID, deviceStatus)
-}
-
-// deviceStatusDeleted is function to process deleted deviceStatus
-func (dc *DownstreamController) deviceStatusDeleted(deviceStatus *v1beta1.DeviceStatus) {
-	deviceStatusID := util.GetResourceID(deviceStatus.Namespace, deviceStatus.Name)
-	dc.deviceStatusManager.DeviceStatus.Delete(deviceStatusID)
-}
-
 // Start DownstreamController
 func (dc *DownstreamController) Start() error {
 	klog.Info("Start downstream devicecontroller")
@@ -497,7 +431,6 @@ func (dc *DownstreamController) Start() error {
 	// TODO need to think about sync
 	time.Sleep(1 * time.Second)
 	go dc.syncDevice()
-	go dc.syncDeviceStatus()
 
 	return nil
 }
@@ -516,19 +449,12 @@ func NewDownstreamController(crdInformerFactory crdinformers.SharedInformerFacto
 		return nil, err
 	}
 
-	deviceStatusManager, err := manager.NewDeviceStatusManager(crdInformerFactory.Devices().V1beta1().DeviceStatuses().Informer())
-	if err != nil {
-		klog.Warningf("Create device status manager failed with error: %s", err)
-		return nil, err
-	}
-
 	dc := &DownstreamController{
-		kubeClient:          client.GetKubeClient(),
-		crdClient:           client.GetCRDClient(),
-		deviceManager:       deviceManager,
-		deviceModelManager:  deviceModelManager,
-		deviceStatusManager: deviceStatusManager,
-		messageLayer:        messagelayer.DeviceControllerMessageLayer(),
+		kubeClient:         client.GetKubeClient(),
+		crdClient:          client.GetCRDClient(),
+		deviceManager:      deviceManager,
+		deviceModelManager: deviceModelManager,
+		messageLayer:       messagelayer.DeviceControllerMessageLayer(),
 	}
 	return dc, nil
 }
