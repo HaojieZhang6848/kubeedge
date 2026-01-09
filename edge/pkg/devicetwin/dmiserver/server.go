@@ -377,7 +377,7 @@ func StartDMIServer(cache *DMICache) {
 		return
 	}
 
-	limiter := rate.NewLimiter(rate.Every(Limit*time.Millisecond), Burst)
+	limiter := rate.NewLimiter(rate.Every(Limit*time.Nanosecond), Burst)
 
 	s := grpc.NewServer()
 	pb.RegisterDeviceManagerServiceServer(s, &server{
