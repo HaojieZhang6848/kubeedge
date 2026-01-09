@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	"k8s.io/klog/v2"
 
@@ -249,6 +250,32 @@ func dataToAny(v interface{}) (*anypb.Any, error) {
 			return nil, err
 		}
 		return anyBool, nil
+	case map[string]interface{}:
+		// 对于嵌套的map，使用 structpb.Struct 来存储
+		st, err := structpb.NewStruct(m)
+		if err != nil {
+			klog.Errorf("failed to convert map to struct: %v", err)
+			return nil, fmt.Errorf("failed to convert map to struct: %v", err)
+		}
+		anyMap, err := anypb.New(st)
+		if err != nil {
+			klog.Errorf("anypb new error: %v", err)
+			return nil, err
+		}
+		return anyMap, nil
+	case []interface{}:
+		// 对于嵌套的切片，使用 structpb.ListValue 来存储
+		lv, err := structpb.NewList(m)
+		if err != nil {
+			klog.Errorf("failed to convert slice to list: %v", err)
+			return nil, fmt.Errorf("failed to convert slice to list: %v", err)
+		}
+		anySlice, err := anypb.New(lv)
+		if err != nil {
+			klog.Errorf("anypb new error: %v", err)
+			return nil, err
+		}
+		return anySlice, nil
 	default:
 		return nil, fmt.Errorf("%v does not support converting to any", reflect.TypeOf(v))
 	}

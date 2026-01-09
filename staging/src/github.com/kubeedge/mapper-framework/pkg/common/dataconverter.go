@@ -26,6 +26,7 @@ import (
 
 	"github.com/golang/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -124,6 +125,18 @@ func DecodeAnyValue(value *anypb.Any) (interface{}, error) {
 			return decodeWrapperValue(value, &wrapperspb.BoolValue{})
 		case "google.protobuf.Int64Value":
 			return decodeWrapperValue(value, &wrapperspb.Int64Value{})
+		case "google.protobuf.Struct":
+			var st structpb.Struct
+			if err := proto.Unmarshal(value.Value, &st); err != nil {
+				return nil, fmt.Errorf("decode Struct error: %v", err)
+			}
+			return st.AsMap(), nil
+		case "google.protobuf.ListValue":
+			var lv structpb.ListValue
+			if err := proto.Unmarshal(value.Value, &lv); err != nil {
+				return nil, fmt.Errorf("decode ListValue error: %v", err)
+			}
+			return lv.AsSlice(), nil
 		default:
 			return nil, fmt.Errorf("unknown type : %s", messageTypeName)
 		}

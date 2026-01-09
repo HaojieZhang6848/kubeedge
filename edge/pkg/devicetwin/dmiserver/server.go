@@ -237,7 +237,7 @@ func StartDMIServer(cache *dmicache.DMICache) error {
 		return fmt.Errorf("fail to create listener with err: %v", err)
 	}
 
-	limiter := rate.NewLimiter(rate.Every(Limit*time.Millisecond), Burst)
+	limiter := rate.NewLimiter(rate.Every(Limit*time.Nanosecond), Burst)
 
 	s := grpc.NewServer()
 	pb.RegisterDeviceManagerServiceServer(s, &server{
