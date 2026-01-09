@@ -17,14 +17,19 @@ limitations under the License.
 package main
 
 import (
+	"net/http"
 	"os"
 
 	"k8s.io/component-base/logs"
 
 	"github.com/kubeedge/kubeedge/cloud/cmd/cloudcore/app"
+	_ "net/http/pprof"
 )
 
 func main() {
+	go func() {
+		http.ListenAndServe("localhost:6060", nil)
+	}()
 	command := app.NewCloudCoreCommand()
 	logs.InitLogs()
 	defer logs.FlushLogs()
